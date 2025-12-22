@@ -523,6 +523,11 @@ pub struct GitPanelSettingsContent {
     ///
     /// Default: false
     pub tree_view: Option<bool>,
+
+    /// How files are grouped in the git panel.
+    ///
+    /// Default: tracked_untracked
+    pub display_mode: Option<DisplayMode>,
 }
 
 #[derive(
@@ -544,6 +549,19 @@ pub enum StatusStyle {
     #[default]
     Icon,
     LabelColor,
+}
+
+/// Controls how files are grouped in the git panel.
+#[derive(
+    Default, Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayMode {
+    /// Group files by tracked vs untracked status (default).
+    #[default]
+    TrackedUntracked,
+    /// Group files by staged vs unstaged status, like VSCode.
+    StagedUnstaged,
 }
 
 #[with_fallible_options]

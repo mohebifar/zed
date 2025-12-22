@@ -876,6 +876,11 @@
     ///
     /// Default: false
     "tree_view": false,
+    // How files are grouped in the git panel.
+    //
+    // Choices: tracked_untracked, staged_unstaged
+    // Default: tracked_untracked
+    "display_mode": "tracked_untracked",
     "scrollbar": {
       // When to show the scrollbar in the git panel.
       //

@@ -9,6 +9,7 @@ use crate::{
     file_history_view::FileHistoryView, git_panel_settings::GitPanelSettings, git_status_icon,
     repository_selector::RepositorySelector,
 };
+use settings::DisplayMode;
 use agent_settings::AgentSettings;
 use anyhow::Context as _;
 use askpass::AskPassDelegate;
@@ -242,6 +243,8 @@ enum Section {
     Conflict,
     Tracked,
     New,
+    Staged,
+    Unstaged,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -259,6 +262,8 @@ impl GitHeaderEntry {
             }
             Section::Tracked => !status.is_created(),
             Section::New => status.is_created(),
+            Section::Staged => status_entry.staging.has_staged(),
+            Section::Unstaged => status_entry.staging.has_unstaged(),
         }
     }
     pub fn title(&self) -> &'static str {
@@ -266,6 +271,8 @@ impl GitHeaderEntry {
             Section::Conflict => "Conflicts",
             Section::Tracked => "Tracked",
             Section::New => "Untracked",
+            Section::Staged => "Staged Changes",
+            Section::Unstaged => "Changes",
         }
     }
 }
@@ -3396,13 +3403,17 @@ impl GitPanel {
         self.entry_count = 0;
         self.max_width_item_index = None;
 
-        let sort_by_path = GitPanelSettings::get_global(cx).sort_by_path;
+        let settings = GitPanelSettings::get_global(cx);
+        let sort_by_path = settings.sort_by_path;
+        let display_mode = settings.display_mode;
         let is_tree_view = matches!(self.view_mode, GitPanelViewMode::Tree(_));
         let group_by_status = is_tree_view || !sort_by_path;
 
         let mut changed_entries = Vec::new();
         let mut new_entries = Vec::new();
         let mut conflict_entries = Vec::new();
+        let mut staged_entries = Vec::new();
+        let mut unstaged_entries = Vec::new();
         let mut single_staged_entry = None;
         let mut staged_count = 0;
         let mut seen_directories = HashSet::default();
@@ -3445,12 +3456,28 @@ impl GitPanel {
                 single_staged_entry = Some(entry.clone());
             }
 
-            if group_by_status && is_conflict {
-                conflict_entries.push(entry);
-            } else if group_by_status && is_new {
-                new_entries.push(entry);
-            } else {
-                changed_entries.push(entry);
+            match display_mode {
+                DisplayMode::TrackedUntracked => {
+                    if group_by_status && is_conflict {
+                        conflict_entries.push(entry);
+                    } else if group_by_status && is_new {
+                        new_entries.push(entry);
+                    } else {
+                        changed_entries.push(entry);
+                    }
+                }
+                DisplayMode::StagedUnstaged => {
+                    if group_by_status && is_conflict {
+                        conflict_entries.push(entry);
+                    } else {
+                        if staging.has_staged() {
+                            staged_entries.push(entry.clone());
+                        }
+                        if staging.has_unstaged() {
+                            unstaged_entries.push(entry);
+                        }
+                    }
+                }
             }
         }
 
@@ -3508,15 +3535,18 @@ impl GitPanel {
                 this.entries.push(entry);
             };
 
-        macro_rules! take_section_entries {
-            () => {
-                [
-                    (Section::Conflict, std::mem::take(&mut conflict_entries)),
-                    (Section::Tracked, std::mem::take(&mut changed_entries)),
-                    (Section::New, std::mem::take(&mut new_entries)),
-                ]
-            };
-        }
+        let section_entries: Vec<(Section, Vec<GitStatusEntry>)> = match display_mode {
+            DisplayMode::TrackedUntracked => vec![
+                (Section::Conflict, std::mem::take(&mut conflict_entries)),
+                (Section::Tracked, std::mem::take(&mut changed_entries)),
+                (Section::New, std::mem::take(&mut new_entries)),
+            ],
+            DisplayMode::StagedUnstaged => vec![
+                (Section::Conflict, std::mem::take(&mut conflict_entries)),
+                (Section::Staged, std::mem::take(&mut staged_entries)),
+                (Section::Unstaged, std::mem::take(&mut unstaged_entries)),
+            ],
+        };
 
         match &mut self.view_mode {
             GitPanelViewMode::Tree(tree_state) => {
@@ -3527,7 +3557,7 @@ impl GitPanel {
                 // because push_entry mutably borrows self
                 let mut tree_state = std::mem::take(tree_state);
 
-                for (section, entries) in take_section_entries!() {
+                for (section, entries) in section_entries {
                     if entries.is_empty() {
                         continue;
                     }
@@ -3557,7 +3587,7 @@ impl GitPanel {
                 self.view_mode = GitPanelViewMode::Tree(tree_state);
             }
             GitPanelViewMode::Flat => {
-                for (section, entries) in take_section_entries!() {
+                for (section, entries) in section_entries {
                     if entries.is_empty() {
                         continue;
                     }
@@ -3614,6 +3644,8 @@ impl GitPanel {
             Section::New => (self.new_staged_count, self.new_count),
             Section::Tracked => (self.tracked_staged_count, self.tracked_count),
             Section::Conflict => (self.conflicted_staged_count, self.conflicted_count),
+            Section::Staged => return ToggleState::Selected,
+            Section::Unstaged => return ToggleState::Unselected,
         };
         if staged_count == 0 {
             ToggleState::Unselected
@@ -4824,14 +4856,16 @@ impl GitPanel {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let tree_view = GitPanelSettings::get_global(cx).tree_view;
+        let settings = GitPanelSettings::get_global(cx);
+        let tree_view = settings.tree_view;
+        let display_mode = settings.display_mode;
         let path_style = self.project.read(cx).path_style(cx);
         let git_path_style = ProjectSettings::get_global(cx).git.path_style;
         let display_name = entry.display_name(path_style);
 
         let selected = self.selected_entry == Some(ix);
         let marked = self.marked_entries.contains(&ix);
-        let status_style = GitPanelSettings::get_global(cx).status_style;
+        let status_style = settings.status_style;
         let status = entry.status;
 
         let has_conflict = status.is_conflicted();
@@ -4952,55 +4986,103 @@ impl GitPanel {
             .hover(|s| s.bg(hover_bg))
             .active(|s| s.bg(active_bg))
             .child(name_row)
-            .child(
-                div()
-                    .id(checkbox_wrapper_id)
-                    .flex_none()
-                    .occlude()
-                    .cursor_pointer()
-                    .child(
-                        Checkbox::new(checkbox_id, is_staged)
+            .child({
+                let stage_action: AnyElement = match display_mode {
+                    DisplayMode::TrackedUntracked => div()
+                        .id(checkbox_wrapper_id)
+                        .flex_none()
+                        .occlude()
+                        .cursor_pointer()
+                        .child(
+                            Checkbox::new(checkbox_id, is_staged)
+                                .disabled(!has_write_access)
+                                .fill()
+                                .elevation(ElevationIndex::Surface)
+                                .on_click_ext({
+                                    let entry = entry.clone();
+                                    let this = cx.weak_entity();
+                                    move |_, click, window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            if !has_write_access {
+                                                return;
+                                            }
+                                            if click.modifiers().shift {
+                                                this.stage_bulk(ix, cx);
+                                            } else {
+                                                let list_entry =
+                                                    if GitPanelSettings::get_global(cx).tree_view {
+                                                        GitListEntry::TreeStatus(
+                                                            GitTreeStatusEntry {
+                                                                entry: entry.clone(),
+                                                                depth,
+                                                            },
+                                                        )
+                                                    } else {
+                                                        GitListEntry::Status(entry.clone())
+                                                    };
+                                                this.toggle_staged_for_entry(
+                                                    &list_entry, window, cx,
+                                                );
+                                            }
+                                            cx.stop_propagation();
+                                        })
+                                        .ok();
+                                    }
+                                })
+                                .tooltip(move |_window, cx| {
+                                    let action = match stage_status {
+                                        StageStatus::Staged => "Unstage",
+                                        StageStatus::Unstaged | StageStatus::PartiallyStaged => {
+                                            "Stage"
+                                        }
+                                    };
+                                    let tooltip_name = action.to_string();
+
+                                    Tooltip::for_action(tooltip_name, &ToggleStaged, cx)
+                                }),
+                        )
+                        .into_any_element(),
+                    DisplayMode::StagedUnstaged => {
+                        let (icon, tooltip_text) = match stage_status {
+                            StageStatus::Staged => (IconName::Dash, "Unstage"),
+                            StageStatus::Unstaged | StageStatus::PartiallyStaged => {
+                                (IconName::Plus, "Stage")
+                            }
+                        };
+                        IconButton::new(checkbox_id, icon)
                             .disabled(!has_write_access)
-                            .fill()
-                            .elevation(ElevationIndex::Surface)
-                            .on_click_ext({
+                            .icon_size(IconSize::Small)
+                            .on_click({
                                 let entry = entry.clone();
                                 let this = cx.weak_entity();
-                                move |_, click, window, cx| {
+                                move |_, window, cx| {
                                     this.update(cx, |this, cx| {
                                         if !has_write_access {
                                             return;
                                         }
-                                        if click.modifiers().shift {
-                                            this.stage_bulk(ix, cx);
-                                        } else {
-                                            let list_entry =
-                                                if GitPanelSettings::get_global(cx).tree_view {
-                                                    GitListEntry::TreeStatus(GitTreeStatusEntry {
-                                                        entry: entry.clone(),
-                                                        depth,
-                                                    })
-                                                } else {
-                                                    GitListEntry::Status(entry.clone())
-                                                };
-                                            this.toggle_staged_for_entry(&list_entry, window, cx);
-                                        }
+                                        let list_entry =
+                                            if GitPanelSettings::get_global(cx).tree_view {
+                                                GitListEntry::TreeStatus(GitTreeStatusEntry {
+                                                    entry: entry.clone(),
+                                                    depth,
+                                                })
+                                            } else {
+                                                GitListEntry::Status(entry.clone())
+                                            };
+                                        this.toggle_staged_for_entry(&list_entry, window, cx);
                                         cx.stop_propagation();
                                     })
                                     .ok();
                                 }
                             })
                             .tooltip(move |_window, cx| {
-                                let action = match stage_status {
-                                    StageStatus::Staged => "Unstage",
-                                    StageStatus::Unstaged | StageStatus::PartiallyStaged => "Stage",
-                                };
-                                let tooltip_name = action.to_string();
-
-                                Tooltip::for_action(tooltip_name, &ToggleStaged, cx)
-                            }),
-                    ),
-            )
+                                Tooltip::for_action(tooltip_text.to_string(), &ToggleStaged, cx)
+                            })
+                            .into_any_element()
+                    }
+                };
+                stage_action
+            })
             .on_click({
                 cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.selected_entry = Some(ix);
